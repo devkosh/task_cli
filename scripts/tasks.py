@@ -716,13 +716,56 @@ def render_status_table(
 
 
 def find_audio_files(task_dir: Path) -> list[Path]:
-    """Return raw/audio/ files not yet transcribed (no matching .txt in transcriptions/)."""
-    raise NotImplementedError
+    """Return raw/audio/ files not yet transcribed (no matching .md in transcriptions/)."""
+    audio_dir = task_dir / "raw" / "audio"
+    trans_dir = task_dir / "transcriptions"
+    extensions = ("*.ogg", "*.mp3", "*.m4a", "*.wav", "*.flac")
+    candidates: list[Path] = []
+    for pattern in extensions:
+        candidates.extend(audio_dir.glob(pattern))
+    result: list[Path] = []
+    for audio_file in candidates:
+        md_path = trans_dir / (audio_file.stem + ".md")
+        if not md_path.exists():
+            result.append(audio_file)
+    return sorted(result)
 
 
-def run_transcription(audio_file: Path, task_dir: Path) -> int:
-    """Run mlx_whisper sequentially on a single audio file; return exit code."""
-    raise NotImplementedError
+def run_transcription(audio_file: Path, task_dir: Path) -> Path:
+    """Run mlx_whisper sequentially on a single audio file; return path to output .md."""
+    output_dir = task_dir / "transcriptions"
+    output_dir.mkdir(exist_ok=True)
+    result = subprocess.run(
+        [
+            "mlx_whisper", str(audio_file),
+            "--model", "mlx-community/whisper-medium-mlx",
+            "--language", "uk",
+            "--output_format", "txt",
+            "--output_dir", str(output_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"⚠ Transcription failed for {audio_file.name}: {result.stderr[:200]}")
+        return output_dir / (audio_file.stem + ".txt")
+
+    # Rename .txt → .md and add frontmatter
+    txt_path = output_dir / (audio_file.stem + ".txt")
+    md_path = output_dir / (audio_file.stem + ".md")
+    if txt_path.exists():
+        content = txt_path.read_text()
+        frontmatter = (
+            f"---\n"
+            f"source: {audio_file.name}\n"
+            f"date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"model: mlx-community/whisper-medium-mlx\n"
+            f"---\n\n"
+        )
+        md_path.write_text(frontmatter + content)
+        txt_path.unlink()  # remove .txt, keep .md
+    print(f"✓ Transcribed: {audio_file.name} → {md_path.name}")
+    return md_path
 
 
 # === GIT HELPERS ===
@@ -1125,7 +1168,19 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
         3. run_transcription() for each file sequentially
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+
+    audio_files = find_audio_files(task_dir)
+    if not audio_files:
+        print(f"No audio files found in {task_dir}/raw/audio/")
+        return 0
+
+    for audio_file in audio_files:
+        run_transcription(audio_file, task_dir)
+
+    print(f"Transcribed {len(audio_files)} file(s).")
+    return 0
 
 
 def cmd_edit(args: argparse.Namespace) -> int:
@@ -1136,7 +1191,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
         2. Open task_dir/task.md in os.environ['EDITOR'] or subprocess 'open -t'
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+    task_md = task_dir / "task.md"
+
+    if not task_md.exists():
+        print(f"Error: task.md not found at {task_md}")
+        return 1
+
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if editor:
+        subprocess.run([editor, str(task_md)])
+    else:
+        subprocess.run(["open", "-t", str(task_md)])  # macOS TextEdit fallback
+
+    return 0
 
 
 # === ARGUMENT PARSER ===
