@@ -21,12 +21,12 @@ from __future__ import annotations
 # === IMPORTS ===
 
 import argparse
+import datetime
 import os
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -55,9 +55,21 @@ TASK_TYPES: list[str] = [
 
 STOPWORDS: frozenset[str] = frozenset(
     {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for",
-        "from", "has", "he", "in", "is", "it", "its", "of", "on",
-        "or", "that", "the", "to", "was", "were", "will", "with",
+        "a", "an", "the", "and", "or", "for", "of", "to", "in", "is",
+        "it", "this", "that", "with", "from", "on", "at", "by", "be",
+        "was", "are", "as", "its", "i", "we", "they", "he", "she",
+        "my", "our", "their", "about", "have", "has", "had", "need",
+        "needs", "some", "any", "all", "not", "no", "can", "will",
+        "do", "done", "did", "get", "got", "make", "made", "take",
+        "taken", "using", "use", "used", "let", "into", "up", "out",
+        "if", "but", "so", "than", "then", "when", "also", "just",
+        "more", "new", "other", "see", "way", "how", "what", "which",
+        "who", "his", "her", "them", "been", "would", "could",
+        "should", "may", "might", "must", "shall", "own", "via",
+        "per", "after", "before", "during", "each", "every", "both",
+        "few", "here", "there", "only", "over", "under", "again",
+        "further", "once", "same", "such", "too", "very",
+        "s", "t", "re", "ll", "ve", "d", "m",
         # Ukrainian stopwords (transliterated equivalents handled at runtime)
         "та", "і", "в", "на", "з", "до", "за", "що", "як",
         "про", "по", "у", "це", "він", "вона", "вони",
@@ -107,23 +119,107 @@ See `raw/context.md`.
 """
 """Template for the per-task CLAUDE.md written during `tasks new`."""
 
+NEW_TASK_PROMPT: str = """\
+You are a task planner. Based on the following context, generate a structured task.md file.
+
+Context:
+{context}
+
+Output a markdown file with these sections:
+# Task Title
+
+## Goal
+One sentence describing what needs to be accomplished.
+
+## Context
+Brief background.
+
+## Deliverables
+- item_v1.md — description
+
+## Notes
+Any important constraints or references.
+"""
+"""Prompt template passed to the AI CLI during `tasks new` to generate task.md."""
+
+_FALLBACK_TASK_TEMPLATE: str = """\
+# Task
+
+## Goal
+Describe the goal here.
+
+## Context
+See `raw/context.md`.
+
+## Deliverables
+- output_v1.md — main deliverable
+
+## Notes
+(none)
+"""
+"""Fallback task.md used when no AI CLI is available or AI generation fails."""
+
 
 # === FRONTMATTER I/O (ruamel.yaml round-trip) ===
 
 
 def read_frontmatter(claude_md_path: Path) -> dict:
     """Parse YAML frontmatter from a CLAUDE.md file; return empty dict on failure."""
-    raise NotImplementedError
+    try:
+        from ruamel.yaml import YAML  # deferred — keep --help working without ruamel
+        yaml = YAML()
+        yaml.preserve_quotes = True
+
+        if not claude_md_path.exists():
+            return {}
+        content = claude_md_path.read_text(encoding="utf-8")
+        yaml_str, _ = _split_frontmatter(content)
+        if not yaml_str:
+            return {}
+        import io
+        result = yaml.load(io.StringIO(yaml_str))
+        return dict(result) if result else {}
+    except Exception:
+        return {}
 
 
 def write_frontmatter(claude_md_path: Path, data: dict) -> None:
     """Write updated frontmatter back to CLAUDE.md preserving body text and comments."""
-    raise NotImplementedError
+    from ruamel.yaml import YAML  # deferred — keep --help working without ruamel
+    import io
+
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.default_flow_style = False
+
+    # Load existing body if file exists
+    body = ""
+    if claude_md_path.exists():
+        content = claude_md_path.read_text(encoding="utf-8")
+        _, body = _split_frontmatter(content)
+
+    # Serialise frontmatter
+    stream = io.StringIO()
+    yaml.dump(data, stream)
+    fm_str = stream.getvalue()
+
+    # Ensure fm_str ends with a newline so the closing --- sits on its own line
+    if not fm_str.endswith("\n"):
+        fm_str += "\n"
+    claude_md_path.write_text(f"---\n{fm_str}---\n{body}", encoding="utf-8")
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:
     """Split raw file text into (yaml_block, body_text); return ('', text) if no frontmatter."""
-    raise NotImplementedError
+    if not text.startswith("---\n"):
+        return ("", text)
+    # Find the closing ---
+    end_idx = text.find("\n---\n", 4)
+    if end_idx == -1:
+        return ("", text)
+    yaml_str = text[4:end_idx]          # content between the two ---
+    body = text[end_idx + 5:]           # content after closing ---\n
+    return (yaml_str, body)
 
 
 # === TASK RESOLUTION (SEC-5) ===
@@ -231,17 +327,59 @@ def _numbered_list_pick(items: list[str], prompt: str = "Select: ") -> Optional[
 
 def heuristic_slug(text: str) -> str:
     """Derive a kebab-case slug from free text by stripping stopwords and joining 3-4 keywords."""
-    raise NotImplementedError
+    # Lowercase
+    lowered = text.lower()
+    # Remove punctuation — keep alphanumeric, spaces, and Ukrainian letters
+    cleaned = re.sub(r"[^\w\s]", " ", lowered, flags=re.UNICODE)
+    # Split into words
+    words = cleaned.split()
+    # Remove stopwords
+    keywords = [w for w in words if w not in STOPWORDS]
+    # Take first 3-4 non-stopword words
+    selected = keywords[:4]
+    if not selected:
+        return "task"
+    return "-".join(selected)
 
 
-def pick_task_type() -> str:
+def pick_task_type(preset: Optional[str] = None) -> str:
     """Present the TASK_TYPES numbered picker; return the chosen type string."""
-    raise NotImplementedError
+    if preset is not None and preset in TASK_TYPES:
+        return preset
+    print("Task type:")
+    for i, t in enumerate(TASK_TYPES, start=1):
+        print(f"  {i}. {t}")
+    while True:
+        try:
+            raw = input("Select type (number): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return TASK_TYPES[0]
+        try:
+            choice = int(raw)
+        except ValueError:
+            print(f"  Enter a number between 1 and {len(TASK_TYPES)}.")
+            continue
+        if 1 <= choice <= len(TASK_TYPES):
+            return TASK_TYPES[choice - 1]
+        print(f"  Out of range. Enter a number between 1 and {len(TASK_TYPES)}.")
 
 
 def confirm_slug(suggested: str) -> str:
     """Prompt user to confirm, edit, or AI-regenerate a suggested slug; return final slug."""
-    raise NotImplementedError
+    print(f"Suggested slug: {suggested}")
+    try:
+        answer = input("[Enter=confirm / type new slug / 'ai'=regenerate]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return suggested
+    if answer == "":
+        return suggested
+    if answer.lower() == "ai":
+        # Regeneration placeholder — context not available here
+        return suggested + "-v2"
+    # User typed a custom slug
+    return answer.replace(" ", "-")
 
 
 # === AI CASCADE (SEC-6) ===
@@ -334,17 +472,47 @@ def _build_review_prompt(task_dir: Path, iteration: int) -> str:
 
 def next_iteration(task_dir: Path) -> int:
     """Scan task_dir/iterations/ and return the next iteration number (1 if empty)."""
-    raise NotImplementedError
+    iterations_dir = task_dir / "iterations"
+    if not iterations_dir.exists():
+        return 1
+    max_n = 0
+    for f in iterations_dir.glob("*.md"):
+        m = re.match(r'^(\d+)_', f.name)
+        if m:
+            n = int(m.group(1))
+            if n > max_n:
+                max_n = n
+    return max_n + 1 if max_n > 0 else 1
 
 
 def versioned_deliverable(name: str, n: int) -> str:
     """Replace _vN suffix in name with _v{n}; append _v{n} if no suffix exists."""
-    raise NotImplementedError
+    if re.search(r'_v\d+', name):
+        return re.sub(r'_v\d+', f'_v{n}', name)
+    p = Path(name)
+    return p.stem + f'_v{n}' + p.suffix
 
 
-def log_work(task_dir: Path, iteration: int, ai_cli: str, exit_code: int) -> Path:
-    """Create and return path of iterations/<n>_work_<ts>.md stub; append summary after AI exit."""
-    raise NotImplementedError
+def log_work(task_dir: Path, n: int) -> Path:
+    """Create and return path of iterations/<n>_work_<ts>.md stub."""
+    iterations_dir = task_dir / "iterations"
+    iterations_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = iterations_dir / f"{n}_work_{ts}.md"
+    date_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    log_path.write_text(
+        f"# Work Session — Iteration {n}\n"
+        f"Date: {date_str}\n"
+        f"Task: {task_dir.name}\n"
+        f"\n"
+        f"## Summary\n"
+        f"(filled after session)\n"
+        f"\n"
+        f"## Files Produced\n"
+        f"(filled after session)\n",
+        encoding="utf-8",
+    )
+    return log_path
 
 
 def log_review(task_dir: Path, iteration: int, passed: bool, failure_notes: str = "") -> Path:
@@ -410,6 +578,18 @@ def git_stage_and_commit(task_dir: Path, message: str) -> int:
 # === COMMAND IMPLEMENTATIONS ===
 
 
+def create_task_folder(task_dir: Path) -> None:
+    """Create the canonical task folder structure under task_dir."""
+    for sub in [
+        task_dir,
+        task_dir / "raw" / "audio",
+        task_dir / "raw" / "files",
+        task_dir / "transcriptions",
+        task_dir / "iterations",
+    ]:
+        sub.mkdir(parents=True, exist_ok=True)
+
+
 def cmd_new(args: argparse.Namespace) -> int:
     """Orchestrate full new-task flow: context capture → AI brief → slug confirm → folder creation.
 
@@ -425,7 +605,95 @@ def cmd_new(args: argparse.Namespace) -> int:
         9. Offer 'tasks work <session/slug>?'
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    # 1. Determine session
+    session: str = getattr(args, "session", None) or datetime.datetime.now().strftime("%d%m%Y")
+
+    print(f"\n=== tasks new (session: {session}) ===\n")
+
+    # 2. Collect multi-line context
+    print("Describe the task (Ctrl+D when done):")
+    try:
+        context_text = sys.stdin.read()
+    except KeyboardInterrupt:
+        print()
+        return 1
+
+    if not context_text.strip():
+        print("No context provided. Aborting.")
+        return 1
+
+    # 3. Generate task.md via AI (with graceful fallback)
+    task_md_content: str
+    try:
+        task_md_content = run_ai_gen(NEW_TASK_PROMPT.format(context=context_text), TASKS_ROOT)
+    except RuntimeError as exc:
+        print(f"  (AI generation unavailable: {exc})")
+        print("  Using fallback task template.")
+        task_md_content = _FALLBACK_TASK_TEMPLATE
+
+    # 4. Heuristic slug → confirm
+    slug = heuristic_slug(context_text)
+    slug = confirm_slug(slug)
+
+    # 5. Pick task type
+    preset_type: Optional[str] = getattr(args, "type", None)
+    task_type = pick_task_type(preset_type)
+
+    # 6. Build task directory
+    task_dir = TASKS_ROOT / session / slug
+
+    # 7. Create folder structure
+    create_task_folder(task_dir)
+
+    # 8. Write raw/context.md
+    (task_dir / "raw" / "context.md").write_text(context_text, encoding="utf-8")
+
+    # 9. Write task.md
+    (task_dir / "task.md").write_text(task_md_content, encoding="utf-8")
+
+    # 10. Write CLAUDE.md with YAML frontmatter
+    today_iso = datetime.datetime.now().strftime("%Y-%m-%d")
+    fm_data = {
+        "slug": slug,
+        "type": task_type,
+        "status": "todo",
+        "created": today_iso,
+        "session": session,
+        "deliverables": [],
+        "outputs": [],
+    }
+    write_frontmatter(task_dir / "CLAUDE.md", fm_data)
+    # Append markdown body after frontmatter
+    existing = (task_dir / "CLAUDE.md").read_text(encoding="utf-8")
+    _, body = _split_frontmatter(existing)
+    if not body.strip():
+        # Write the body section
+        body_text = f"\n# {slug}\n\nTask created by `tasks new`.\n"
+        fm_raw, _ = _split_frontmatter(existing)
+        if not fm_raw.endswith("\n"):
+            fm_raw += "\n"
+        (task_dir / "CLAUDE.md").write_text(
+            f"---\n{fm_raw}---\n{body_text}", encoding="utf-8"
+        )
+
+    print(f"\n✓ Task created: {session}/{slug}\n")
+
+    # 11. Offer to start working
+    try:
+        answer = input("Run tasks work now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer in ("", "y", "yes"):
+        args.task = f"{session}/{slug}"
+        try:
+            return cmd_work(args)
+        except NotImplementedError:
+            print("  (tasks work is not yet implemented — run it manually)")
+            return 0
+
+    return 0
 
 
 def cmd_work(args: argparse.Namespace) -> int:
@@ -442,7 +710,58 @@ def cmd_work(args: argparse.Namespace) -> int:
         8. Prompt 'Run review now? [Y/n]' → optionally call cmd_review
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    # 1. Resolve task
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+
+    # 2. Read frontmatter and update status todo → in_progress
+    fm = read_frontmatter(task_dir / "CLAUDE.md")
+    if fm.get("status") == "todo":
+        fm["status"] = "in_progress"
+        write_frontmatter(task_dir / "CLAUDE.md", fm)
+
+    # 3. Get next iteration number
+    n = next_iteration(task_dir)
+
+    # 4. Get versioned deliverables
+    deliverables = fm.get("deliverables", [])
+    versioned = [versioned_deliverable(d, n) for d in deliverables]
+
+    # 5. Create iteration log stub
+    log_path = log_work(task_dir, n)
+
+    # 6. Print header
+    print(f"\n=== tasks work: {task_dir} (iteration {n}) ===\n")
+    if versioned:
+        print(f"Target outputs: {versioned}\n")
+
+    # 7. Find AI CLI
+    cli = find_ai_cli()
+    if cli is None:
+        print("Error: No AI CLI found (tried: claude, codex, agy). Install one to run work sessions.")
+        sys.exit(1)
+
+    # 8. Run work session
+    run_ai_work(task_dir)
+
+    # 9. Append summary to iteration log
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n---\nWork session complete.\n")
+
+    # 10. Prompt for review
+    try:
+        answer = input("\nRun review now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer in ("", "y", "yes"):
+        try:
+            return cmd_review(args)
+        except NotImplementedError:
+            print("  (tasks review is not yet implemented — run it manually)")
+
+    return 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:
