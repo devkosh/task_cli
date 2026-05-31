@@ -515,14 +515,58 @@ def log_work(task_dir: Path, n: int) -> Path:
     return log_path
 
 
-def log_review(task_dir: Path, iteration: int, passed: bool, failure_notes: str = "") -> Path:
-    """Create and return path of iterations/<n>_review_<ts>.md; record pass/fail + notes."""
-    raise NotImplementedError
+def log_review(task_dir: Path, n: int) -> Path:
+    """Create and return path of iterations/<n>_review_<ts>.md stub."""
+    iterations_dir = task_dir / "iterations"
+    iterations_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = iterations_dir / f"{n}_review_{ts}.md"
+    date_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    log_path.write_text(
+        f"# Review Session — Iteration {n}\n"
+        f"Date: {date_str}\n"
+        f"Task: {task_dir.name}\n"
+        f"\n"
+        f"## Review Notes\n"
+        f"(filled during session)\n"
+        f"\n"
+        f"## Outcome\n"
+        f"(passed / failed — filled after session)\n",
+        encoding="utf-8",
+    )
+    return log_path
 
 
-def update_context_log(task_dir: Path, iteration: int, summary: str) -> None:
-    """Rewrite the '## Iteration Log' section in raw/context.md with the new iteration entry."""
-    raise NotImplementedError
+def update_context_log(task_dir: Path, n: int) -> None:
+    """Rewrite the '## Iteration Log' section in raw/context.md with all iteration entries."""
+    context_path = task_dir / "raw" / "context.md"
+    content = context_path.read_text(encoding="utf-8") if context_path.exists() else ""
+
+    # Find all iteration files grouped by iteration number
+    iterations_dir = task_dir / "iterations"
+    iter_files: dict[int, list[Path]] = {}
+    if iterations_dir.exists():
+        for f in sorted(iterations_dir.glob("*.md")):
+            m = re.match(r'^(\d+)_', f.name)
+            if m:
+                num = int(m.group(1))
+                iter_files.setdefault(num, []).append(f)
+
+    # Build the log section
+    log_lines = ["## Iteration Log\n"]
+    for num in sorted(iter_files):
+        log_lines.append(f"\n### Iteration {num}\n")
+        for f in iter_files[num]:
+            log_lines.append(f"- [{f.name}](iterations/{f.name})\n")
+    log_section = "".join(log_lines)
+
+    # Replace or append
+    if "## Iteration Log" in content:
+        content = re.sub(r'## Iteration Log.*$', log_section, content, flags=re.DOTALL)
+    else:
+        content = content.rstrip() + "\n\n" + log_section
+
+    context_path.write_text(content, encoding="utf-8")
 
 
 # === OUTPUT DETECTION & README (SEC-10) ===
@@ -783,7 +827,79 @@ def cmd_review(args: argparse.Namespace) -> int:
               (cmd_work will then call next_iteration() to get N+1 for the next cycle)
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    # 1. Resolve task
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+
+    # 2. Read frontmatter and update status in_progress → reviewing
+    fm = read_frontmatter(task_dir / "CLAUDE.md")
+    if fm.get("status") == "in_progress":
+        fm["status"] = "reviewing"
+        write_frontmatter(task_dir / "CLAUDE.md", fm)
+
+    # 3. Determine N = next_iteration - 1 (review belongs to the same iteration as last work session)
+    n = next_iteration(task_dir) - 1
+    if n < 1:
+        n = 1
+
+    # 4. Create review log
+    log_path = log_review(task_dir, n)
+
+    # 5. Print header
+    print(f"\n=== tasks review: {task_dir} (iteration {n}) ===\n")
+
+    # 6. Find AI CLI
+    cli = find_ai_cli()
+    if cli is None:
+        print("Error: No AI CLI found (tried: claude, codex, agy). Install one to run review sessions.")
+        sys.exit(1)
+
+    # 7. Run review session
+    run_ai_review(task_dir)
+
+    # 8. Prompt for outcome
+    try:
+        answer = input("\nReview passed? [y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer in ("y", ""):
+        print("✓ Review passed.")
+        update_context_log(task_dir, n)
+        try:
+            run_done = input("Run tasks done? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if run_done in ("", "y", "yes"):
+            try:
+                return cmd_done(args)
+            except NotImplementedError:
+                print("  (tasks done is not yet implemented — run it manually)")
+    else:
+        # Failed path
+        try:
+            failure_note = input("What failed? ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            failure_note = ""
+        # Append failure note to review log
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n---\nOutcome: failed\nFailure note: {failure_note}\n")
+        print("Re-run tasks work when ready.")
+        try:
+            run_work = input("Run tasks work now? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if run_work in ("", "y", "yes"):
+            try:
+                return cmd_work(args)
+            except NotImplementedError:
+                print("  (tasks work is not yet implemented — run it manually)")
+
+    return 0
 
 
 def cmd_done(args: argparse.Namespace) -> int:
