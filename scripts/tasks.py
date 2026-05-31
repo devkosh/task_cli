@@ -129,29 +129,101 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
 # === TASK RESOLUTION (SEC-5) ===
 
 
-def list_tasks(filter_session: Optional[str] = None, filter_type: Optional[str] = None) -> list[Path]:
-    """Glob TASKS_ROOT for all */*/CLAUDE.md paths, optionally filtered by session or type."""
-    raise NotImplementedError
+def list_tasks(
+    filter_session: Optional[str] = None,
+    filter_type: Optional[str] = None,
+    filter_status: Optional[str] = None,
+) -> list[Path]:
+    """Glob TASKS_ROOT for all */*/CLAUDE.md paths, optionally filtered by session, type, or status."""
+    task_dirs: list[Path] = []
+    for claude_md in TASKS_ROOT.glob("*/*/CLAUDE.md"):
+        task_dir = claude_md.parent.relative_to(TASKS_ROOT)
+        # Filter by session (first path component)
+        if filter_session is not None and task_dir.parts[0] != filter_session:
+            continue
+        # Filter by type or status via frontmatter (silently skip if NotImplementedError)
+        if filter_type is not None or filter_status is not None:
+            try:
+                fm = read_frontmatter(claude_md)
+                if filter_type is not None and fm.get("type") != filter_type:
+                    continue
+                if filter_status is not None and fm.get("status") != filter_status:
+                    continue
+            except (NotImplementedError, Exception):
+                continue
+        task_dirs.append(task_dir)
+    return sorted(task_dirs)
 
 
 def pick_task(tasks: list[Path]) -> Optional[Path]:
     """Interactively select a task via fzf; fall back to numbered list if fzf absent."""
-    raise NotImplementedError
+    if not tasks:
+        print("No tasks found.")
+        sys.exit(1)
+    if len(tasks) == 1:
+        return tasks[0]
+    # Build display strings like "31052026/video-compress"
+    labels = [str(t) for t in tasks]
+    if _fzf_available():
+        input_text = "\n".join(labels) + "\n"
+        try:
+            result = subprocess.run(
+                ["fzf", "--prompt", "Select task: "],
+                input=input_text,
+                text=True,
+                capture_output=True,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                print("No task selected.")
+                sys.exit(1)
+            chosen = result.stdout.strip()
+            return Path(chosen)
+        except Exception as exc:
+            print(f"fzf error: {exc}. Falling back to numbered list.")
+    # Fallback: numbered list
+    idx = _numbered_list_pick(labels)
+    if idx is None:
+        print("No task selected.")
+        sys.exit(1)
+    return tasks[idx]
 
 
-def find_task(arg: Optional[str] = None) -> Optional[Path]:
+def find_task(arg: Optional[str] = None, session_override: Optional[str] = None) -> Optional[Path]:
     """Resolve a task from an optional CLI argument (exact path, session/slug, or picker)."""
-    raise NotImplementedError
+    # If arg looks like an exact DDMMYYYY/slug path and the directory exists, use it directly
+    if arg is not None:
+        candidate = TASKS_ROOT / arg
+        if candidate.is_dir():
+            return Path(arg)
+    # Otherwise, launch interactive picker
+    tasks = list_tasks(filter_session=session_override)
+    return pick_task(tasks)
 
 
 def _fzf_available() -> bool:
     """Return True if fzf is on PATH."""
-    raise NotImplementedError
+    return shutil.which("fzf") is not None
 
 
 def _numbered_list_pick(items: list[str], prompt: str = "Select: ") -> Optional[int]:
     """Print a numbered list and read a 1-based integer choice from stdin; return None on cancel."""
-    raise NotImplementedError
+    for i, item in enumerate(items, start=1):
+        print(f"  {i}. {item}")
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if raw.lower() in ("", "q", "quit", "cancel"):
+            return None
+        try:
+            choice = int(raw)
+        except ValueError:
+            print(f"  Invalid input. Enter a number between 1 and {len(items)}, or 'q' to cancel.")
+            continue
+        if 1 <= choice <= len(items):
+            return choice - 1  # Return 0-based index
+        print(f"  Out of range. Enter a number between 1 and {len(items)}, or 'q' to cancel.")
 
 
 # === SLUG & TYPE HELPERS (SEC-7) ===
@@ -399,7 +471,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     # tasks new
-    subparsers.add_parser("new", help="Create a new task interactively")
+    new = subparsers.add_parser("new", help="Create a new task interactively")
+    new.add_argument("--session", metavar="DDMMYYYY", help="Override session folder (default: today)")
+    new.add_argument("--type", dest="type", choices=TASK_TYPES, help="Pre-select task type")
 
     # tasks work [task]
     work = subparsers.add_parser("work", help="Run an AI work session for a task")
@@ -456,7 +530,11 @@ def main() -> None:
     if handler is None:
         parser.error(f"Unknown command: {args.command!r}")
 
-    sys.exit(handler(args))  # type: ignore[call-arg]
+    try:
+        sys.exit(handler(args))  # type: ignore[call-arg]
+    except NotImplementedError:
+        print(f"Command '{args.command}' is not yet implemented.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
