@@ -126,9 +126,18 @@ find_task(args.task)
 
 ### `tasks review` (SEC-9)
 
+**Iteration N for review:** After `cmd_work` runs, `next_iteration()` returns `work_N + 1`.
+Review belongs to the *same* iteration as the work it reviews, so:
+```python
+N = next_iteration(task_dir) - 1
+```
+This pairs `N_work_<ts>.md` with `N_review_<ts>.md`. Do NOT call `next_iteration()` naively
+here — that would create a mismatched `(N+1)_review_<ts>.md` log.
+
 ```
 find_task(args.task)
     → write_frontmatter(status: reviewing)
+    → N = next_iteration(task_dir) - 1   ← same N as the preceding work session
     → log stub = log_review(task_dir, N, passed=None)
     → _build_review_prompt(task_dir, N)
     → run_ai_review(task_dir)   [inherits terminal]
@@ -137,7 +146,7 @@ find_task(args.task)
            prompt "tasks done? [Y/n]"  → cmd_done if yes
         n: "What failed?" → stdin
            log_review appends failure notes
-           prompt "tasks work? [Y/n]"  → cmd_work if yes
+           prompt "tasks work? [Y/n]"  → cmd_work if yes (which increments N to N+1)
 ```
 
 ### `tasks done` (SEC-10)

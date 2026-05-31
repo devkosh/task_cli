@@ -322,11 +322,17 @@ def cmd_review(args: argparse.Namespace) -> int:
     Steps (SEC-9):
         1. Resolve task via find_task(args.task)
         2. status: in_progress → reviewing via write_frontmatter
-        3. log_review() creates iterations/<n>_review_<ts>.md
-        4. find_ai_cli() → run_ai_review(task_dir)
-        5. Prompt 'Review passed? [y/n]'
+        3. Determine N = next_iteration(task_dir) - 1
+           NOTE: review belongs to the SAME iteration as the preceding work session.
+           After cmd_work writes <N>_work_<ts>.md, next_iteration() returns N+1,
+           so review must use N+1-1 = N to produce paired <N>_review_<ts>.md logs.
+           Do NOT call next_iteration() naively (would create (N+1)_review mismatch).
+        4. log_review() creates iterations/<n>_review_<ts>.md
+        5. _build_review_prompt(task_dir, N) → find_ai_cli() → run_ai_review(task_dir)
+        6. Prompt 'Review passed? [y/n]'
            - y: update_context_log() → offer 'tasks done'
            - n: collect failure notes → append to review log → offer 'tasks work'
+              (cmd_work will then call next_iteration() to get N+1 for the next cycle)
     Returns 0 on success, non-zero on error.
     """
     raise NotImplementedError
