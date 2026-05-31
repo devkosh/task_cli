@@ -663,7 +663,53 @@ def render_status_table(
     filter_open: bool = False,
 ) -> None:
     """Print a formatted table of task status icons, slugs, types, sessions, and deliverables."""
-    raise NotImplementedError
+    # Sort: session descending, then slug ascending
+    sorted_tasks = sorted(tasks, key=lambda t: (-int(t.parts[0]) if t.parts[0].isdigit() else 0, t.parts[1] if len(t.parts) > 1 else ""))
+
+    # Column widths (chars, emoji counts as 2 so icon rows use ljust(width - 1))
+    W_STATUS = 14   # header "STATUS" fits in 14; data row has emoji → ljust(13)
+    W_SESSION = 10
+    W_SLUG = 24
+    W_TYPE = 16
+
+    # Header row (no emoji, full ljust)
+    header = (
+        "STATUS".ljust(W_STATUS)
+        + "SESSION".ljust(W_SESSION)
+        + "SLUG".ljust(W_SLUG)
+        + "TYPE".ljust(W_TYPE)
+    )
+    separator = "─" * (W_STATUS + W_SESSION + W_SLUG + W_TYPE)
+    print(header)
+    print(separator)
+
+    if not sorted_tasks:
+        print("No tasks found.")
+        print(f"\n0 task(s)")
+        return
+
+    for task_rel in sorted_tasks:
+        parts = task_rel.parts
+        session = parts[0] if len(parts) > 0 else ""
+        slug = parts[1] if len(parts) > 1 else str(task_rel)
+
+        fm = read_frontmatter(TASKS_ROOT / task_rel / "CLAUDE.md")
+        status = fm.get("status", "unknown")
+        task_type = fm.get("type", "")
+
+        icon = STATUS_ICONS.get(status, "❓")
+        # Build status cell: icon + space + status name, padded
+        # Emoji counts as 2 chars in terminal → reduce ljust by 1
+        status_cell = f"{icon} {status}"
+        row = (
+            status_cell.ljust(W_STATUS - 1)
+            + session.ljust(W_SESSION)
+            + slug.ljust(W_SLUG)
+            + task_type.ljust(W_TYPE)
+        )
+        print(row)
+
+    print(f"\n{len(sorted_tasks)} task(s)")
 
 
 # === TRANSCRIPTION HELPERS (SEC-12) ===
@@ -1049,10 +1095,25 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     Steps (SEC-11):
         1. list_tasks(filter_session=args.session, filter_type=args.type)
-        2. render_status_table(tasks, filter_open=args.open)
+        2. Optionally filter out "done" tasks when args.open is True
+        3. render_status_table(tasks)
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    session_filter = getattr(args, "session", None)
+    type_filter = getattr(args, "type", None)
+    open_only = getattr(args, "open", False)
+
+    tasks = list_tasks(filter_session=session_filter, filter_type=type_filter)
+
+    if open_only:
+        # Filter out "done" tasks by reading each task's frontmatter
+        tasks = [
+            t for t in tasks
+            if read_frontmatter(TASKS_ROOT / t / "CLAUDE.md").get("status") != "done"
+        ]
+
+    render_status_table(tasks)
+    return 0
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
