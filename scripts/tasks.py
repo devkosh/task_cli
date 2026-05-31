@@ -249,27 +249,84 @@ def confirm_slug(suggested: str) -> str:
 
 def find_ai_cli() -> Optional[str]:
     """Return the first available AI CLI from AI_CASCADE via shutil.which(), or None."""
-    raise NotImplementedError
+    for cli in AI_CASCADE:
+        if shutil.which(cli) is not None:
+            return cli
+    return None
 
 
 def run_ai_gen(prompt: str, task_dir: Path) -> str:
     """Run AI CLI non-interactively with prompt; capture and return stdout."""
-    raise NotImplementedError
+    cli = find_ai_cli()
+    if cli is None:
+        raise RuntimeError("No AI CLI found (tried: claude, codex, agy)")
+
+    if cli == "claude":
+        cmd = ["claude", "--print", "-p", prompt]
+    elif cli == "codex":
+        cmd = ["codex", "run", "--no-interactive", prompt]
+    else:  # agy
+        cmd = ["agy", prompt]
+
+    result = subprocess.run(cmd, cwd=task_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"AI gen failed ({cli}): {result.stderr[:500]}")
+    return result.stdout.strip()
 
 
 def run_ai_work(task_dir: Path) -> int:
     """Launch AI CLI in yolo/autonomous work mode inside task_dir; inherit terminal; return exit code."""
-    raise NotImplementedError
+    work_prompt = _build_work_prompt(task_dir)
+    cli = find_ai_cli()
+    if cli is None:
+        print("Error: No AI CLI found (tried: claude, codex, agy)")
+        sys.exit(1)
+
+    if cli == "claude":
+        cmd = ["claude", "--dangerously-skip-permissions", "-p", work_prompt]
+    elif cli == "codex":
+        cmd = ["codex", "run", work_prompt]
+    else:  # agy
+        cmd = ["agy", work_prompt]
+
+    result = subprocess.run(cmd, cwd=task_dir)
+    return result.returncode
 
 
 def run_ai_review(task_dir: Path) -> int:
     """Launch AI CLI in yolo/autonomous review mode inside task_dir; inherit terminal; return exit code."""
-    raise NotImplementedError
+    review_prompt = _build_review_prompt(task_dir, iteration=0)
+    cli = find_ai_cli()
+    if cli is None:
+        print("Error: No AI CLI found (tried: claude, codex, agy)")
+        sys.exit(1)
+
+    if cli == "claude":
+        cmd = ["claude", "--dangerously-skip-permissions", "-p", review_prompt]
+    elif cli == "codex":
+        cmd = ["codex", "run", review_prompt]
+    else:  # agy
+        cmd = ["agy", review_prompt]
+
+    result = subprocess.run(cmd, cwd=task_dir)
+    return result.returncode
+
+
+def _build_work_prompt(task_dir: Path) -> str:
+    """Construct the yolo work prompt string."""
+    return (
+        f"Read ./task.md and execute everything described in it. No approval needed. "
+        f"Produce all ## Deliverables listed. When done, create AGENT_RESULT.md with a brief summary of what was produced.\n"
+        f"Work directory: {task_dir.name}"
+    )
 
 
 def _build_review_prompt(task_dir: Path, iteration: int) -> str:
     """Construct the review prompt string from task.md and the latest work iteration log."""
-    raise NotImplementedError
+    return (
+        "Read ./task.md and ./AGENT_RESULT.md. Review the deliverables produced against the task requirements.\n"
+        "Ask at most 5 clarifying questions. After corrections, confirm all deliverables are present and correct."
+    )
 
 
 # === ITERATION & VERSIONING (SEC-8, SEC-9) ===
