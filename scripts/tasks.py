@@ -572,19 +572,87 @@ def update_context_log(task_dir: Path, n: int) -> None:
 # === OUTPUT DETECTION & README (SEC-10) ===
 
 
-def detect_outputs(task_dir: Path, iteration: int) -> list[Path]:
-    """Parse ## Deliverables from task.md, derive versioned filenames, return those that exist."""
-    raise NotImplementedError
+def detect_outputs(task_dir: Path, n: int) -> list[str]:
+    """Parse ## Deliverables from task.md, apply versioning, return list of versioned filenames.
+
+    Does NOT filter by on-disk existence — returns all declared deliverables.
+    Existence checks are done in cmd_done (step 5–6).
+    """
+    task_md = task_dir / "task.md"
+    if not task_md.exists():
+        return []
+
+    lines = task_md.read_text(encoding="utf-8").splitlines()
+    in_section = False
+    results: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## Deliverables":
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith("## "):
+                # Next section header — stop
+                break
+            if stripped.startswith("- "):
+                item = stripped[2:].strip()
+                # Extract filename part: take text before " — " separator (em-dash)
+                if " — " in item:
+                    name = item.split(" — ", 1)[0].strip()
+                else:
+                    name = item.strip()
+                if name:
+                    results.append(versioned_deliverable(name, n))
+
+    return results
 
 
-def confirm_outputs(found: list[Path], missing: list[str]) -> bool:
-    """Print detected/missing outputs and ask user to confirm before registering."""
-    raise NotImplementedError
+def confirm_outputs(outputs: list[str]) -> list[str]:
+    """Print detected outputs and ask user to confirm or provide a custom list.
+
+    Returns:
+        Full list if confirmed, custom list if user provides one, [] if none declared.
+    """
+    if not outputs:
+        print("No outputs declared in task.md.")
+        return []
+
+    print("Detected outputs:")
+    for i, name in enumerate(outputs, start=1):
+        print(f"  {i}. {name}")
+
+    try:
+        answer = input("Confirm? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return outputs
+
+    if answer in ("", "y", "yes"):
+        return outputs
+
+    # User declined — ask for manual list
+    try:
+        raw = input("Enter filenames (comma-separated): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
+
+    if not raw:
+        return []
+    return [f.strip() for f in raw.split(",") if f.strip()]
 
 
-def rebuild_readme() -> int:
-    """Run scripts/rebuild_readme.py as a subprocess; return its exit code."""
-    raise NotImplementedError
+def rebuild_readme() -> None:
+    """Run scripts/rebuild_readme.py as a subprocess; warn on failure but do not crash."""
+    result = subprocess.run(
+        ["python3", str(TASKS_ROOT / "scripts" / "rebuild_readme.py")],
+        cwd=TASKS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"⚠ README rebuild failed: {result.stderr[:200]}")
 
 
 # === STATUS TABLE (SEC-11) ===
@@ -614,9 +682,21 @@ def run_transcription(audio_file: Path, task_dir: Path) -> int:
 # === GIT HELPERS ===
 
 
-def git_stage_and_commit(task_dir: Path, message: str) -> int:
-    """Stage task_dir contents and create a git commit in TASKS_ROOT; return exit code."""
-    raise NotImplementedError
+def git_stage_and_commit(task_dir: Path) -> None:
+    """Stage task_dir contents and README.md, then commit with 'feat({slug}): done'."""
+    slug = f"{task_dir.parent.name}/{task_dir.name}"  # e.g. "31052026/video-compress"
+    subprocess.run(["git", "add", str(task_dir)], cwd=TASKS_ROOT)
+    subprocess.run(["git", "add", "README.md"], cwd=TASKS_ROOT, check=False)
+    result = subprocess.run(
+        ["git", "commit", "-m", f"feat({slug}): done"],
+        cwd=TASKS_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        print(f"✓ Committed: feat({slug}): done")
+    else:
+        print(f"⚠ Commit failed: {result.stderr[:200]}")
 
 
 # === COMMAND IMPLEMENTATIONS ===
@@ -914,7 +994,54 @@ def cmd_done(args: argparse.Namespace) -> int:
         6. Prompt 'Commit? [y/N]' → git_stage_and_commit()
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    # 1. Resolve task (find_task returns path relative to TASKS_ROOT)
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+
+    # 2. Read frontmatter
+    fm = read_frontmatter(task_dir / "CLAUDE.md")
+
+    # 3. Get current iteration N (last completed iteration)
+    n = max(next_iteration(task_dir) - 1, 1)
+
+    # 4. Parse declared deliverables from task.md
+    declared = detect_outputs(task_dir, n)
+
+    # 5. Check which exist on disk; warn about missing
+    for name in declared:
+        if not (task_dir / name).exists():
+            print(f"⚠ Missing: {name}")
+
+    # 6. Confirm outputs with user
+    approved = confirm_outputs(declared)
+
+    # 7. Update frontmatter: set status = done, append confirmed outputs (no duplicates)
+    fm["status"] = "done"
+    existing_outputs = fm.setdefault("outputs", [])
+    for o in approved:
+        if o not in existing_outputs:
+            existing_outputs.append(o)
+    write_frontmatter(task_dir / "CLAUDE.md", fm)
+
+    print(f"\n✓ Task marked done: {task_dir}\n")
+
+    # 8. Run README rebuild (errors are caught — must not crash done flow)
+    try:
+        rebuild_readme()
+    except Exception as exc:
+        print(f"⚠ README rebuild error: {exc}")
+
+    # 9. Offer to commit
+    try:
+        answer = input("Commit? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer in ("y", "yes"):
+        git_stage_and_commit(task_dir)
+
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
