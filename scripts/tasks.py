@@ -472,17 +472,47 @@ def _build_review_prompt(task_dir: Path, iteration: int) -> str:
 
 def next_iteration(task_dir: Path) -> int:
     """Scan task_dir/iterations/ and return the next iteration number (1 if empty)."""
-    raise NotImplementedError
+    iterations_dir = task_dir / "iterations"
+    if not iterations_dir.exists():
+        return 1
+    max_n = 0
+    for f in iterations_dir.glob("*.md"):
+        m = re.match(r'^(\d+)_', f.name)
+        if m:
+            n = int(m.group(1))
+            if n > max_n:
+                max_n = n
+    return max_n + 1 if max_n > 0 else 1
 
 
 def versioned_deliverable(name: str, n: int) -> str:
     """Replace _vN suffix in name with _v{n}; append _v{n} if no suffix exists."""
-    raise NotImplementedError
+    if re.search(r'_v\d+', name):
+        return re.sub(r'_v\d+', f'_v{n}', name)
+    p = Path(name)
+    return p.stem + f'_v{n}' + p.suffix
 
 
-def log_work(task_dir: Path, iteration: int, ai_cli: str, exit_code: int) -> Path:
-    """Create and return path of iterations/<n>_work_<ts>.md stub; append summary after AI exit."""
-    raise NotImplementedError
+def log_work(task_dir: Path, n: int) -> Path:
+    """Create and return path of iterations/<n>_work_<ts>.md stub."""
+    iterations_dir = task_dir / "iterations"
+    iterations_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_path = iterations_dir / f"{n}_work_{ts}.md"
+    date_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    log_path.write_text(
+        f"# Work Session — Iteration {n}\n"
+        f"Date: {date_str}\n"
+        f"Task: {task_dir.name}\n"
+        f"\n"
+        f"## Summary\n"
+        f"(filled after session)\n"
+        f"\n"
+        f"## Files Produced\n"
+        f"(filled after session)\n",
+        encoding="utf-8",
+    )
+    return log_path
 
 
 def log_review(task_dir: Path, iteration: int, passed: bool, failure_notes: str = "") -> Path:
@@ -680,7 +710,58 @@ def cmd_work(args: argparse.Namespace) -> int:
         8. Prompt 'Run review now? [Y/n]' → optionally call cmd_review
     Returns 0 on success, non-zero on error.
     """
-    raise NotImplementedError
+    # 1. Resolve task
+    task_rel = find_task(getattr(args, 'task', None))
+    task_dir = TASKS_ROOT / task_rel
+
+    # 2. Read frontmatter and update status todo → in_progress
+    fm = read_frontmatter(task_dir / "CLAUDE.md")
+    if fm.get("status") == "todo":
+        fm["status"] = "in_progress"
+        write_frontmatter(task_dir / "CLAUDE.md", fm)
+
+    # 3. Get next iteration number
+    n = next_iteration(task_dir)
+
+    # 4. Get versioned deliverables
+    deliverables = fm.get("deliverables", [])
+    versioned = [versioned_deliverable(d, n) for d in deliverables]
+
+    # 5. Create iteration log stub
+    log_path = log_work(task_dir, n)
+
+    # 6. Print header
+    print(f"\n=== tasks work: {task_dir} (iteration {n}) ===\n")
+    if versioned:
+        print(f"Target outputs: {versioned}\n")
+
+    # 7. Find AI CLI
+    cli = find_ai_cli()
+    if cli is None:
+        print("Error: No AI CLI found (tried: claude, codex, agy). Install one to run work sessions.")
+        sys.exit(1)
+
+    # 8. Run work session
+    run_ai_work(task_dir)
+
+    # 9. Append summary to iteration log
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n---\nWork session complete.\n")
+
+    # 10. Prompt for review
+    try:
+        answer = input("\nRun review now? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+
+    if answer in ("", "y", "yes"):
+        try:
+            return cmd_review(args)
+        except NotImplementedError:
+            print("  (tasks review is not yet implemented — run it manually)")
+
+    return 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:
