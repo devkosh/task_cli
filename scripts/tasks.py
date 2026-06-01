@@ -325,6 +325,17 @@ def _numbered_list_pick(items: list[str], prompt: str = "Select: ") -> Optional[
 # === SLUG & TYPE HELPERS (SEC-7) ===
 
 
+def _sanitize_slug(text: str) -> str:
+    """Strip ANSI escape codes and normalize to ASCII kebab-case."""
+    # Strip ANSI escape sequences (arrow keys, colours, etc.)
+    text = re.sub(r"\x1b(?:\[[0-9;]*[a-zA-Z]|[^[])", "", text)
+    # Keep only ASCII alphanumeric and hyphens; map everything else to hyphen
+    text = re.sub(r"[^a-zA-Z0-9\-]", "-", text)
+    # Collapse consecutive hyphens, strip leading/trailing
+    text = re.sub(r"-{2,}", "-", text).strip("-").lower()
+    return text or "task"
+
+
 def heuristic_slug(text: str) -> str:
     """Derive a kebab-case slug from free text by stripping stopwords and joining 3-4 keywords."""
     # Lowercase
@@ -367,19 +378,23 @@ def pick_task_type(preset: Optional[str] = None) -> str:
 
 def confirm_slug(suggested: str) -> str:
     """Prompt user to confirm, edit, or AI-regenerate a suggested slug; return final slug."""
-    print(f"Suggested slug: {suggested}")
-    try:
-        answer = input("[Enter=confirm / type new slug / 'ai'=regenerate]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return suggested
-    if answer == "":
-        return suggested
-    if answer.lower() == "ai":
-        # Regeneration placeholder — context not available here
-        return suggested + "-v2"
-    # User typed a custom slug
-    return answer.replace(" ", "-")
+    while True:
+        print(f"Suggested slug: {suggested}")
+        try:
+            answer = input("[Enter=confirm / type new slug / 'ai'=regenerate]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return suggested
+        if answer == "":
+            return suggested
+        if answer.lower() == "ai":
+            return suggested + "-v2"
+        # Sanitize: strip ANSI escape codes, normalize to kebab-case
+        candidate = _sanitize_slug(answer)
+        if len(candidate) < 2:
+            print(f"  Invalid slug {answer!r} → '{candidate}'. Please type a valid slug (e.g. 'my-task').")
+            continue
+        return candidate
 
 
 # === AI CASCADE (SEC-6) ===
