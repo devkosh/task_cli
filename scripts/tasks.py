@@ -36,8 +36,8 @@ from typing import Optional
 
 # === CONSTANTS ===
 
-TASKS_ROOT: Path = Path(__file__).resolve().parent.parent
-"""Absolute path to the repository root (one level above scripts/)."""
+TASKS_ROOT: Path = Path(os.environ["TASKS_ROOT"]) if "TASKS_ROOT" in os.environ else Path(__file__).resolve().parent.parent
+"""Absolute path to the repository root. Override via TASKS_ROOT env var."""
 
 AI_CASCADE: list[str] = ["claude", "codex", "agy"]
 """Ordered list of AI CLI tools to try; first found wins."""
@@ -1208,6 +1208,148 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+# === DAEMON MANAGEMENT ===
+
+_PLIST_LABEL = "com.tasks.audiowatcher"
+_PLIST_DST = Path.home() / "Library" / "LaunchAgents" / f"{_PLIST_LABEL}.plist"
+_LOG_FILE = Path.home() / ".local" / "var" / "log" / "tasks-daemon.log"
+_WATCH_SCRIPT = TASKS_ROOT / "scripts" / "watch-audio.sh"
+
+_PLIST_TEMPLATE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{watch_script}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_file}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TASKS_ROOT</key>
+    <string>{tasks_root}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+"""
+
+
+def _daemon_install() -> int:
+    if not _WATCH_SCRIPT.exists():
+        print(f"Error: watch script not found at {_WATCH_SCRIPT}")
+        print("Expected scripts/watch-audio.sh in the tasks repo.")
+        return 1
+
+    _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PLIST_DST.parent.mkdir(parents=True, exist_ok=True)
+
+    plist_content = _PLIST_TEMPLATE.format(
+        label=_PLIST_LABEL,
+        watch_script=str(_WATCH_SCRIPT),
+        log_file=str(_LOG_FILE),
+        tasks_root=str(TASKS_ROOT),
+    )
+    _PLIST_DST.write_text(plist_content)
+
+    result = subprocess.run(
+        ["launchctl", "load", "-w", str(_PLIST_DST)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error loading plist: {result.stderr.strip()}")
+        return 1
+
+    print(f"Installed: {_PLIST_DST}")
+    print(f"Log:       {_LOG_FILE}")
+    print("Daemon is running and will auto-start on login.")
+    return 0
+
+
+def _daemon_uninstall() -> int:
+    if not _PLIST_DST.exists():
+        print("Daemon is not installed.")
+        return 0
+
+    subprocess.run(
+        ["launchctl", "unload", "-w", str(_PLIST_DST)],
+        capture_output=True,
+    )
+    _PLIST_DST.unlink(missing_ok=True)
+    print(f"Uninstalled: {_PLIST_DST}")
+    return 0
+
+
+def _daemon_status() -> int:
+    result = subprocess.run(
+        ["launchctl", "list", _PLIST_LABEL],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print("stopped  (not loaded)")
+        return 1
+
+    # launchctl list output includes PID on first line when running
+    lines = result.stdout.strip().splitlines()
+    pid = None
+    for line in lines:
+        if '"PID"' in line or line.startswith("{"):
+            continue
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            pid = parts[0]
+            break
+
+    # Simpler: parse JSON-style output for PID key
+    import re as _re
+    m = _re.search(r'"PID"\s*=\s*(\d+)', result.stdout)
+    if m:
+        pid = m.group(1)
+        print(f"running  (PID {pid})")
+    else:
+        print("loaded but not running  (check log for errors)")
+    return 0
+
+
+def _daemon_log() -> int:
+    if not _LOG_FILE.exists():
+        print(f"No log file at {_LOG_FILE} — has the daemon been installed?")
+        return 1
+    try:
+        subprocess.run(["tail", "-f", str(_LOG_FILE)])
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """Manage the audio-watcher daemon (install/uninstall/status/log)."""
+    sub = getattr(args, "daemon_command", None)
+    if sub == "install":
+        return _daemon_install()
+    if sub == "uninstall":
+        return _daemon_uninstall()
+    if sub == "status":
+        return _daemon_status()
+    if sub == "log":
+        return _daemon_log()
+    print("Usage: tasks daemon <install|uninstall|status|log>")
+    return 1
+
+
 # === ARGUMENT PARSER ===
 
 
@@ -1250,6 +1392,14 @@ def build_parser() -> argparse.ArgumentParser:
     edit = subparsers.add_parser("edit", help="Open task.md in $EDITOR")
     edit.add_argument("task", nargs="?", help="session/slug or path (optional — triggers picker)")
 
+    # tasks daemon <sub>
+    daemon = subparsers.add_parser("daemon", help="Manage the audio-watcher daemon")
+    daemon_sub = daemon.add_subparsers(dest="daemon_command", metavar="SUBCOMMAND")
+    daemon_sub.add_parser("install", help="Install and start the daemon (auto-starts on login)")
+    daemon_sub.add_parser("uninstall", help="Stop and remove the daemon")
+    daemon_sub.add_parser("status", help="Show daemon running/stopped status")
+    daemon_sub.add_parser("log", help="Tail the daemon log file")
+
     return parser
 
 
@@ -1269,6 +1419,7 @@ def main() -> None:
         "status": cmd_status,
         "transcribe": cmd_transcribe,
         "edit": cmd_edit,
+        "daemon": cmd_daemon,
     }
 
     if args.command is None:
