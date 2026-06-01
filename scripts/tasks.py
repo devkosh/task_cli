@@ -1208,6 +1208,38 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+# === SEMANTIC SEARCH ===
+
+_INDEX_SCRIPT = TASKS_ROOT / "scripts" / "index_tasks.py"
+_SEARCH_SCRIPT = TASKS_ROOT / "scripts" / "search_tasks.py"
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    """Build or update the semantic search index."""
+    if not _INDEX_SCRIPT.exists():
+        print(f"Error: {_INDEX_SCRIPT} not found.")
+        return 1
+    cmd = [sys.executable, str(_INDEX_SCRIPT)]
+    if getattr(args, "session", None):
+        cmd += ["--session", args.session]
+    if getattr(args, "verbose", False):
+        cmd.append("--verbose")
+    return subprocess.run(cmd).returncode
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Search the semantic index."""
+    if not _SEARCH_SCRIPT.exists():
+        print(f"Error: {_SEARCH_SCRIPT} not found.")
+        return 1
+    cmd = [sys.executable, str(_SEARCH_SCRIPT), args.query]
+    if getattr(args, "top", None):
+        cmd += ["--top", str(args.top)]
+    if getattr(args, "doc_type", None):
+        cmd += ["--type", args.doc_type]
+    return subprocess.run(cmd).returncode
+
+
 # === HOOKS MANAGEMENT ===
 
 _HOOKS_SOURCE_DIR = TASKS_ROOT / "scripts" / "hooks"
@@ -1442,6 +1474,18 @@ def build_parser() -> argparse.ArgumentParser:
     edit = subparsers.add_parser("edit", help="Open task.md in $EDITOR")
     edit.add_argument("task", nargs="?", help="session/slug or path (optional — triggers picker)")
 
+    # tasks index
+    index_p = subparsers.add_parser("index", help="Build or update the semantic search index")
+    index_p.add_argument("--session", metavar="DDMMYYYY", help="Index only one session folder")
+    index_p.add_argument("--verbose", "-v", action="store_true", help="Print each file as indexed")
+
+    # tasks search <query>
+    search_p = subparsers.add_parser("search", help="Semantic search over transcriptions and outputs")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("--top", type=int, default=5, metavar="N", help="Number of results (default 5)")
+    search_p.add_argument("--type", choices=["transcription", "output"], dest="doc_type",
+                          help="Filter by document type")
+
     # tasks hooks <sub>
     hooks = subparsers.add_parser("hooks", help="Install or check git hooks from scripts/hooks/")
     hooks_sub = hooks.add_subparsers(dest="hooks_command", metavar="SUBCOMMAND")
@@ -1475,6 +1519,8 @@ def main() -> None:
         "status": cmd_status,
         "transcribe": cmd_transcribe,
         "edit": cmd_edit,
+        "index": cmd_index,
+        "search": cmd_search,
         "hooks": cmd_hooks,
         "daemon": cmd_daemon,
     }
