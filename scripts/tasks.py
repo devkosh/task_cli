@@ -36,8 +36,30 @@ from typing import Optional
 
 # === CONSTANTS ===
 
-TASKS_ROOT: Path = Path(os.environ["TASKS_ROOT"]) if "TASKS_ROOT" in os.environ else Path(__file__).resolve().parent.parent
-"""Absolute path to the repository root. Override via TASKS_ROOT env var."""
+_CONFIG_FILE: Path = Path.home() / ".config" / "tasks" / "root"
+"""Persisted active tasks root. Written by `tasks init` and `tasks cngdir`."""
+
+
+def _read_config_root() -> Optional[Path]:
+    """Return the path stored in ~/.config/tasks/root, or None if missing/invalid."""
+    if _CONFIG_FILE.exists():
+        p = Path(_CONFIG_FILE.read_text(encoding="utf-8").strip())
+        return p if p.is_dir() else None
+    return None
+
+
+def _write_config_root(path: Path) -> None:
+    """Persist path as the active tasks root."""
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CONFIG_FILE.write_text(str(path.resolve()), encoding="utf-8")
+
+
+TASKS_ROOT: Path = (
+    Path(os.environ["TASKS_ROOT"]) if "TASKS_ROOT" in os.environ
+    else _read_config_root() or Path(__file__).resolve().parent.parent
+)
+"""Absolute path to the repository root.
+Resolution order: TASKS_ROOT env var → ~/.config/tasks/root → script parent."""
 
 AI_CASCADE: list[str] = ["claude", "codex", "agy"]
 """Ordered list of AI CLI tools to try; first found wins."""
@@ -1305,6 +1327,174 @@ def cmd_hooks(args: argparse.Namespace) -> int:
     return 1
 
 
+# === REPO INIT & ROOT SWITCHING ===
+
+_SCRIPT_SOURCE_DIR = Path(__file__).resolve().parent
+
+_README_SKELETON = """\
+# Tasks
+
+Реєстр завдань, підзадач та отриманих результатів. Структуровані за датами сесій.
+
+## Огляд завдань
+
+<!-- AUTO-TABLE-START -->
+| Сесія | Slug | Тип | Статус | Summary | Outputs |
+|-------|------|-----|--------|---------|---------|
+<!-- AUTO-TABLE-END -->
+
+---
+
+*Останнє оновлення: {date}*
+"""
+
+_CLAUDE_MD_SKELETON = """\
+# CLAUDE.md — Governance
+
+## Структура репозиторію задач
+
+```
+tasks/
+├── CLAUDE.md
+├── DDMMYYYY/
+│   └── task-slug/
+│       ├── CLAUDE.md        # YAML frontmatter: slug, type, status, session, deliverables, outputs
+│       ├── task.md
+│       ├── raw/
+│       │   ├── audio/       # вихідні аудіо (*.ogg, *.m4a, *.mp3) — не в git
+│       │   └── files/
+│       └── transcriptions/
+└── scripts/
+    └── rebuild_readme.py
+```
+
+## Типи задач
+
+`personnel` | `reporting` | `procurement` | `presentation` | `retro` | `extraction` | `planning`
+"""
+
+_GITIGNORE_SKELETON = """\
+# Audio / video — large, not in git
+*.wav
+*.m4a
+*.ogg
+*.mp3
+*.mov
+*.mp4
+*.avi
+*.mkv
+
+# Semantic search index — local artifact
+.search-index/
+
+# Session context — local only
+SESSION_SUMMARY_*.md
+
+.DS_Store
+"""
+
+_PRE_COMMIT_HOOK = """\
+#!/usr/bin/env bash
+# Rebuild the AUTO-TABLE in README.md from task CLAUDE.md frontmatter before every commit.
+set -e
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+python3 "$REPO_ROOT/scripts/rebuild_readme.py"
+git add "$REPO_ROOT/README.md"
+"""
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold a new tasks repo and set it as the active root (SEC-110)."""
+    target = Path(getattr(args, "path", None) or ".").expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+
+    created: list[str] = []
+    skipped: list[str] = []
+
+    def _write(rel: str, content: str, executable: bool = False) -> None:
+        p = target / rel
+        if p.exists():
+            skipped.append(rel)
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        if executable:
+            p.chmod(0o755)
+        created.append(rel)
+
+    today = datetime.date.today().strftime("%d.%m.%Y")
+    _write("README.md", _README_SKELETON.format(date=today))
+    _write("CLAUDE.md", _CLAUDE_MD_SKELETON)
+    _write(".gitignore", _GITIGNORE_SKELETON)
+
+    # Copy rebuild_readme.py from task_cli/scripts
+    rebuild_src = _SCRIPT_SOURCE_DIR / "rebuild_readme.py"
+    rebuild_dst = target / "scripts" / "rebuild_readme.py"
+    if rebuild_src.exists() and not rebuild_dst.exists():
+        rebuild_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(rebuild_src, rebuild_dst)
+        created.append("scripts/rebuild_readme.py")
+    elif rebuild_dst.exists():
+        skipped.append("scripts/rebuild_readme.py")
+
+    _write("scripts/hooks/pre-commit", _PRE_COMMIT_HOOK, executable=True)
+
+    # git init
+    git_dir = target / ".git"
+    if not git_dir.exists():
+        result = subprocess.run(["git", "init", str(target)], capture_output=True, text=True)
+        if result.returncode == 0:
+            created.append(".git/")
+        else:
+            print(f"Warning: git init failed: {result.stderr.strip()}")
+    else:
+        skipped.append(".git/ (already exists)")
+
+    # Install pre-commit hook
+    hook_src = target / "scripts" / "hooks" / "pre-commit"
+    hook_dst = target / ".git" / "hooks" / "pre-commit"
+    if hook_src.exists():
+        shutil.copy2(hook_src, hook_dst)
+        hook_dst.chmod(0o755)
+        created.append(".git/hooks/pre-commit")
+
+    # Persist as active root
+    _write_config_root(target)
+
+    print(f"Initialized tasks repo: {target}")
+    if created:
+        for f in created:
+            print(f"  created : {f}")
+    if skipped:
+        for f in skipped:
+            print(f"  skipped : {f} (already exists)")
+    print(f"\nActive root set to: {target}")
+    print("Run 'tasks status' to verify.")
+    return 0
+
+
+def cmd_cngdir(args: argparse.Namespace) -> int:
+    """Switch the active TASKS_ROOT to an existing repo (SEC-111)."""
+    target = Path(args.path).expanduser().resolve()
+
+    if not target.exists() or not target.is_dir():
+        print(f"Error: path does not exist or is not a directory: {target}")
+        return 1
+
+    # Validate it looks like a tasks repo
+    task_claudes = list(target.glob("*/*/CLAUDE.md"))
+    force = getattr(args, "force", False)
+    if not task_claudes and not force:
+        print(f"Warning: no task CLAUDE.md files found in {target}")
+        print("This doesn't look like a tasks repo. Use --force to set it anyway.")
+        return 1
+
+    _write_config_root(target)
+    task_count = len(task_claudes)
+    print(f"Active tasks root → {target}  ({task_count} task(s) found)")
+    return 0
+
+
 # === DAEMON MANAGEMENT ===
 
 _PLIST_LABEL = "com.tasks.audiowatcher"
@@ -1489,6 +1679,16 @@ def build_parser() -> argparse.ArgumentParser:
     edit = subparsers.add_parser("edit", help="Open task.md in $EDITOR")
     edit.add_argument("task", nargs="?", help="session/slug or path (optional — triggers picker)")
 
+    # tasks init [path]
+    init_p = subparsers.add_parser("init", help="Scaffold a new tasks repo and set it as active root")
+    init_p.add_argument("path", nargs="?", default=".", metavar="PATH",
+                        help="Directory to initialize (default: current directory)")
+
+    # tasks cngdir <path>
+    cngdir_p = subparsers.add_parser("cngdir", help="Switch active TASKS_ROOT to an existing repo")
+    cngdir_p.add_argument("path", metavar="PATH", help="Path to an existing tasks repo")
+    cngdir_p.add_argument("--force", action="store_true", help="Skip tasks-repo validation check")
+
     # tasks index
     index_p = subparsers.add_parser("index", help="Build or update the semantic search index")
     index_p.add_argument("--session", metavar="DDMMYYYY", help="Index only one session folder")
@@ -1534,6 +1734,8 @@ def main() -> None:
         "status": cmd_status,
         "transcribe": cmd_transcribe,
         "edit": cmd_edit,
+        "init": cmd_init,
+        "cngdir": cmd_cngdir,
         "index": cmd_index,
         "search": cmd_search,
         "hooks": cmd_hooks,
