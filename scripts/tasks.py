@@ -64,7 +64,10 @@ Resolution order: TASKS_ROOT env var → ~/.config/tasks/root → script parent.
 AI_CASCADE: list[str] = ["claude", "codex", "agy"]
 """Ordered list of AI CLI tools to try; first found wins."""
 
-TASK_TYPES: list[str] = [
+_TYPES_CONFIG: Path = Path.home() / ".config" / "tasks" / "types"
+"""Persisted custom task types (one per line). Merged with built-ins at startup."""
+
+_BUILTIN_TASK_TYPES: list[str] = [
     "personnel",
     "reporting",
     "procurement",
@@ -73,7 +76,27 @@ TASK_TYPES: list[str] = [
     "extraction",
     "planning",
 ]
-"""Numbered type picker options shown during `tasks new`."""
+
+
+def _load_custom_types() -> list[str]:
+    if not _TYPES_CONFIG.exists():
+        return []
+    return [
+        line.strip() for line in _TYPES_CONFIG.read_text(encoding="utf-8").splitlines()
+        if line.strip() and line.strip() not in _BUILTIN_TASK_TYPES
+    ]
+
+
+def _save_custom_type(t: str) -> None:
+    _TYPES_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_custom_types()
+    if t not in existing and t not in _BUILTIN_TASK_TYPES:
+        with _TYPES_CONFIG.open("a", encoding="utf-8") as fh:
+            fh.write(t + "\n")
+
+
+TASK_TYPES: list[str] = _BUILTIN_TASK_TYPES + _load_custom_types()
+"""All known task types: built-ins merged with ~/.config/tasks/types."""
 
 STOPWORDS: frozenset[str] = frozenset(
     {
@@ -396,6 +419,63 @@ def pick_task_type(preset: Optional[str] = None) -> str:
         if 1 <= choice <= len(TASK_TYPES):
             return TASK_TYPES[choice - 1]
         print(f"  Out of range. Enter a number between 1 and {len(TASK_TYPES)}.")
+
+
+def _heuristic_type(context: str) -> str:
+    """Keyword-based fallback type detection when AI is unavailable."""
+    text = context.lower()
+    if any(w in text for w in ["інтерв", "interview", "hr", "personnel", "кадр", "персонал"]):
+        return "personnel"
+    if any(w in text for w in ["тендер", "procurement", "закупівл", "критерії", "постачальник"]):
+        return "procurement"
+    if any(w in text for w in ["ретро", "retro", "retrospect", "підсумок"]):
+        return "retro"
+    # extraction before presentation — "стиснення pdf слайдів" is extraction, not presentation
+    if any(w in text for w in ["конвертац", "стиснен", "extract", "pdf", "excel", "xlsx"]):
+        return "extraction"
+    if any(w in text for w in ["презентац", "presentation", "слайд", "slide", "deck"]):
+        return "presentation"
+    if any(w in text for w in ["звіт", "report", "дашборд", "dashboard", "статистик", "таблиц"]):
+        return "reporting"
+    return "planning"
+
+
+def ai_identify_type(context: str) -> str:
+    """Use AI to identify the task type from context. Persists new types to ~/.config/tasks/types."""
+    known = ", ".join(TASK_TYPES)
+    prompt = (
+        f"Identify the task type in 1-2 words (English, kebab-case).\n"
+        f"Task context:\n{context[:600]}\n\n"
+        f"Known types: {known}\n"
+        f"Use a known type if it fits well. Otherwise invent a concise new type "
+        f"(e.g. 'research', 'interview', 'logistics'). "
+        f"Reply with ONLY the type name, nothing else."
+    )
+
+    cli = find_ai_cli()
+    if cli:
+        try:
+            if cli == "claude":
+                cmd = ["claude", "--print", "-p", prompt]
+            elif cli == "codex":
+                cmd = ["codex", "run", "--no-interactive", prompt]
+            else:
+                cmd = ["agy", prompt]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                raw = result.stdout.strip().lower().splitlines()[0]
+                type_str = _sanitize_slug(raw)
+                if len(type_str) >= 2:
+                    if type_str not in TASK_TYPES:
+                        _save_custom_type(type_str)
+                        TASK_TYPES.append(type_str)
+                        print(f"  New type '{type_str}' saved.")
+                    return type_str
+        except Exception:
+            pass
+
+    return _heuristic_type(context)
 
 
 def confirm_slug(suggested: str) -> str:
@@ -885,9 +965,13 @@ def cmd_new(args: argparse.Namespace) -> int:
     slug = heuristic_slug(context_text)
     slug = confirm_slug(slug)
 
-    # 5. Pick task type
+    # 5. Identify task type via AI (or use --type override)
     preset_type: Optional[str] = getattr(args, "type", None)
-    task_type = pick_task_type(preset_type)
+    if preset_type:
+        task_type = preset_type
+    else:
+        task_type = ai_identify_type(context_text)
+        print(f"  Type: {task_type}")
 
     # 6. Build task directory
     task_dir = TASKS_ROOT / session / slug
@@ -1651,7 +1735,7 @@ def build_parser() -> argparse.ArgumentParser:
     # tasks new
     new = subparsers.add_parser("new", help="Create a new task interactively")
     new.add_argument("--session", metavar="DDMMYYYY", help="Override session folder (default: today)")
-    new.add_argument("--type", dest="type", choices=TASK_TYPES, help="Pre-select task type")
+    new.add_argument("--type", dest="type", metavar="TYPE", help="Override task type (AI detects by default)")
 
     # tasks work [task]
     work = subparsers.add_parser("work", help="Run an AI work session for a task")
@@ -1668,7 +1752,7 @@ def build_parser() -> argparse.ArgumentParser:
     # tasks status
     status = subparsers.add_parser("status", help="Print task status table")
     status.add_argument("--session", metavar="DDMMYYYY", help="Filter by session folder name")
-    status.add_argument("--type", dest="type", choices=TASK_TYPES, help="Filter by task type")
+    status.add_argument("--type", dest="type", metavar="TYPE", help="Filter by task type")
     status.add_argument("--open", action="store_true", help="Show only non-done tasks")
 
     # tasks transcribe [task]
