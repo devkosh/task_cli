@@ -857,8 +857,8 @@ def run_transcription(audio_file: Path, task_dir: Path) -> Path:
             "mlx_whisper", str(audio_file),
             "--model", "mlx-community/whisper-medium-mlx",
             "--language", "uk",
-            "--output_format", "txt",
-            "--output_dir", str(output_dir),
+            "--output-format", "txt",
+            "--output-dir", str(output_dir),
         ],
         capture_output=True,
         text=True,
@@ -1585,7 +1585,12 @@ _PLIST_LABEL = "com.tasks.audiowatcher"
 _PLIST_DST = Path.home() / "Library" / "LaunchAgents" / f"{_PLIST_LABEL}.plist"
 _LOG_FILE = Path.home() / ".local" / "var" / "log" / "tasks-daemon.log"
 _WATCH_SCRIPT = TASKS_ROOT / "scripts" / "watch-audio.sh"
+# Script is deployed here so launchd can exec it without TCC/Sequoia restrictions
+_DEPLOYED_SCRIPT = Path.home() / ".local" / "lib" / "tasks" / "watch-audio.sh"
 
+# Uses Program key (direct exec via shebang) instead of /bin/bash <script>.
+# This avoids the macOS Sequoia exit-126 "Operation not permitted" issue
+# that occurs when launchd invokes bash to execute a script from ~/Documents/.
 _PLIST_TEMPLATE = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -1594,10 +1599,11 @@ _PLIST_TEMPLATE = """\
 <dict>
   <key>Label</key>
   <string>{label}</string>
+  <key>Program</key>
+  <string>{deployed_script}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/bash</string>
-    <string>{watch_script}</string>
+    <string>{deployed_script}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -1628,13 +1634,22 @@ def _daemon_install() -> int:
     _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     _PLIST_DST.parent.mkdir(parents=True, exist_ok=True)
 
+    # Deploy script to ~/.local/lib/tasks/ — outside ~/Documents/ so launchd
+    # can execute it without hitting macOS Sequoia's TCC/execution restrictions.
+    _DEPLOYED_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_WATCH_SCRIPT, _DEPLOYED_SCRIPT)
+    _DEPLOYED_SCRIPT.chmod(0o755)
+
     plist_content = _PLIST_TEMPLATE.format(
         label=_PLIST_LABEL,
-        watch_script=str(_WATCH_SCRIPT),
+        deployed_script=str(_DEPLOYED_SCRIPT),
         log_file=str(_LOG_FILE),
         tasks_root=str(TASKS_ROOT),
     )
     _PLIST_DST.write_text(plist_content)
+
+    # Unload first in case an old version is running
+    subprocess.run(["launchctl", "unload", str(_PLIST_DST)], capture_output=True)
 
     result = subprocess.run(
         ["launchctl", "load", "-w", str(_PLIST_DST)],
@@ -1645,6 +1660,7 @@ def _daemon_install() -> int:
         return 1
 
     print(f"Installed: {_PLIST_DST}")
+    print(f"Script:    {_DEPLOYED_SCRIPT}")
     print(f"Log:       {_LOG_FILE}")
     print("Daemon is running and will auto-start on login.")
     return 0
