@@ -1208,6 +1208,56 @@ def cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+# === HOOKS MANAGEMENT ===
+
+_HOOKS_SOURCE_DIR = TASKS_ROOT / "scripts" / "hooks"
+_GIT_HOOKS_DIR = TASKS_ROOT / ".git" / "hooks"
+_MANAGED_HOOKS = ["pre-commit"]
+
+
+def cmd_hooks(args: argparse.Namespace) -> int:
+    """Install or check git hooks from scripts/hooks/ into .git/hooks/."""
+    sub = getattr(args, "hooks_command", None)
+
+    if sub == "install":
+        if not _HOOKS_SOURCE_DIR.exists():
+            print(f"Error: hooks source dir not found at {_HOOKS_SOURCE_DIR}")
+            return 1
+        installed = []
+        for hook_name in _MANAGED_HOOKS:
+            src = _HOOKS_SOURCE_DIR / hook_name
+            dst = _GIT_HOOKS_DIR / hook_name
+            if not src.exists():
+                print(f"  skip: {hook_name} (source not found)")
+                continue
+            import shutil as _shutil
+            _shutil.copy2(src, dst)
+            dst.chmod(0o755)
+            installed.append(hook_name)
+            print(f"  installed: .git/hooks/{hook_name}")
+        if installed:
+            print(f"Git hooks installed ({len(installed)}). Run 'tasks hooks status' to verify.")
+        return 0
+
+    if sub == "status":
+        all_ok = True
+        for hook_name in _MANAGED_HOOKS:
+            dst = _GIT_HOOKS_DIR / hook_name
+            src = _HOOKS_SOURCE_DIR / hook_name
+            if not dst.exists():
+                print(f"  missing : .git/hooks/{hook_name}  (run: tasks hooks install)")
+                all_ok = False
+            elif src.exists() and dst.read_bytes() != src.read_bytes():
+                print(f"  outdated: .git/hooks/{hook_name}  (run: tasks hooks install)")
+                all_ok = False
+            else:
+                print(f"  ok      : .git/hooks/{hook_name}")
+        return 0 if all_ok else 1
+
+    print("Usage: tasks hooks <install|status>")
+    return 1
+
+
 # === DAEMON MANAGEMENT ===
 
 _PLIST_LABEL = "com.tasks.audiowatcher"
@@ -1392,6 +1442,12 @@ def build_parser() -> argparse.ArgumentParser:
     edit = subparsers.add_parser("edit", help="Open task.md in $EDITOR")
     edit.add_argument("task", nargs="?", help="session/slug or path (optional — triggers picker)")
 
+    # tasks hooks <sub>
+    hooks = subparsers.add_parser("hooks", help="Install or check git hooks from scripts/hooks/")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", metavar="SUBCOMMAND")
+    hooks_sub.add_parser("install", help="Copy scripts/hooks/* → .git/hooks/ (chmod +x)")
+    hooks_sub.add_parser("status", help="Check if managed hooks are installed and up to date")
+
     # tasks daemon <sub>
     daemon = subparsers.add_parser("daemon", help="Manage the audio-watcher daemon")
     daemon_sub = daemon.add_subparsers(dest="daemon_command", metavar="SUBCOMMAND")
@@ -1419,6 +1475,7 @@ def main() -> None:
         "status": cmd_status,
         "transcribe": cmd_transcribe,
         "edit": cmd_edit,
+        "hooks": cmd_hooks,
         "daemon": cmd_daemon,
     }
 
